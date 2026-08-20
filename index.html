@@ -166,7 +166,7 @@ input[type=search]{width:150px}
 .sec-h .note{font-size:11.5px;color:var(--muted)}
 
 /* ---------- totals band ---------- */
-.totals{display:grid;grid-template-columns:repeat(6,1fr);background:var(--ink);border-radius:3px;
+.totals{display:grid;grid-template-columns:repeat(4,1fr);background:var(--ink);border-radius:3px;
   overflow:hidden;gap:1px}
 .tot{background:var(--panel);padding:14px 16px 15px}
 .tot-k{font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;
@@ -478,7 +478,11 @@ function colmap(headerRow){
       if(contains) for(const c of cands){ const i=raw.findIndex(h=>h&&h.includes(c)); if(i>=0) return i; }
       return -1;
     },
-    findLike(re){ return raw.findIndex(h=>h&&re.test(h)); }
+    findLike(re){ return raw.findIndex(h=>h&&re.test(h)); },
+    /* Charge heads must match exactly. find() falls back to startsWith, which
+       would bind POL to POL1 or POLA (POL1 is an exact duplicate of POL in the
+       FOIS export, so a loose match silently double-counts). */
+    findExact(c){ return raw.indexOf(c); }
   };
 }
 
@@ -486,7 +490,7 @@ const F_TOK=["rr no","rr date","sttn from","wght actl","wght chrg","sttn to"];
 const P_TOK=["rr no","plant net weight","siding name","shortage","rake reciept date","rake receipt date","rr wt"];
 const L_TOK=["rr no","rake receive date","siding","rr qty","sr no","rake no"];
 
-let FREIGHT=null, PLANT=null, LAB=null, ROWS=[], GCV_FOUND=false, WARN=[];
+let FREIGHT=null, PLANT=null, LAB=null, ROWS=[], GCV_FOUND=false, CHRG_FOUND=false, WARN=[];
 
 /* A rake can appear on more than one tab — a month boundary, or a revised sheet.
    Rather than let sheet order decide, the row carrying more actual data wins. */
@@ -520,8 +524,16 @@ function readFreight(wb){
       frt:cm.find(["grand total incl dmrg","grand total (frgt+gst)","grand total","totl frgt"],true),
       inv:cm.find(["invc no"]),
       fnr:cm.find(["fnr"]),
-      gcv:cm.findLike(/gcv|gross calorific/)
+      gcv:cm.findLike(/gcv|gross calorific/),
+      /* underload valuation + the four charge heads, all matched exactly */
+      rate:cm.find(["rate(q)","rate (q)","rate"]),
+      pol:cm.findExact("pol"),
+      pola:cm.findExact("pola"),
+      enhc:cm.findExact("enhc"),
+      fauc:cm.findExact("fauc"),
+      dcla:cm.findExact("dcla")
     };
+    if(c.pol>=0||c.pola>=0||c.enhc>=0||c.fauc>=0||c.dcla>=0) CHRG_FOUND=true;
     if(c.rr<0) continue;
     if(c.act>=0) anyAct=true;
     if(c.gcv>=0) GCV_FOUND=true;
@@ -540,13 +552,20 @@ function readFreight(wb){
         frt:c.frt>=0?num(row[c.frt]):null,
         inv:c.inv>=0?(row[c.inv]==null?"":String(row[c.inv]).trim()):"",
         fnr:c.fnr>=0?(row[c.fnr]==null?"":String(row[c.fnr]).trim()):"",
-        gcv:c.gcv>=0?num(row[c.gcv]):null
+        gcv:c.gcv>=0?num(row[c.gcv]):null,
+        rate:c.rate>=0?num(row[c.rate]):null,
+        pol:c.pol>=0?num(row[c.pol]):null,
+        pola:c.pola>=0?num(row[c.pola]):null,
+        enhc:c.enhc>=0?num(row[c.enhc]):null,
+        fauc:c.fauc>=0?num(row[c.fauc]):null,
+        dcla:c.dcla>=0?num(row[c.dcla]):null
       }, x=>x.qty!=null?1:0, tally);
       }
     if(n) sheets.push({name:loc.sheet,n});
   }
   if(!sheets.length) throw new Error("No 'RR NO.' column found in any sheet of the freight file.");
   if(!anyAct) WARN.push("No <b>WGHT ACTL</b> column in the freight file \u2014 quantity as per RR falls back to the plant sheet's RR WT.");
+  if(!CHRG_FOUND) WARN.push("No <b>POL / POLA / ENHC / FAUC / DCLA</b> columns in the freight file, so the charges composite and its per-MT figure show as \u2014.");
   return {map:out, sheets, dup:tally.dup, n:out.size, note:sheetNote(sheets,tally.dup)};
 }
 
@@ -702,6 +721,26 @@ function build(){
     const cb  = p?p.cb:null;
     const sh  = (qty!=null&&net!=null)? qty-net : null;
     const shCB= (cb!=null&&net!=null)? cb-net : null;
+
+    /* Underload = chargeable weight not actually shipped, i.e. tonnage paid for
+       and not railed. Floored at zero: 17 rakes in the sample ran the other way
+       (actual above chargeable), and that is an overload, penalised separately
+       through POL rather than netted off here. Both readings come from the
+       freight row itself, never the plant fallback, so the subtraction stays
+       within one document. */
+    const und   = (f&&f.chg!=null&&f.qty!=null) ? Math.max(0, f.chg-f.qty) : null;
+    const undRs = (und!=null&&f.rate!=null) ? und*f.rate : null;
+
+    /* POL1 restates POL rather than adding to it, and POLA/SD sit outside the
+       four heads asked for, so only these four are summed. A rake with none of
+       them charged is a real zero, not a gap, provided the columns exist.
+
+       POLA is added to the POL head. Unlike POL1 it is a distinct charge: across
+       the sample it never equals POL or POL1, ten rakes carry both at different
+       values, fourteen carry POLA with no POL at all, and it bears no fixed rate
+       against WGHT POL1. So it adds rather than double-counts. */
+    const comp  = (f&&CHRG_FOUND)
+      ? (f.pol||0)+(f.pola||0)+(f.enhc||0)+(f.fauc||0)+(f.dcla||0) : null;
     rows.push({
       rr:k,
       date:(f&&f.date)?f.date:(p?p.date:null),
@@ -714,6 +753,12 @@ function build(){
       rcvAlt:(l&&l.rcv&&p&&p.rcv&&l.rcv.getTime()!==p.rcv.getTime())?p.rcv:null,
       rake:(p&&p.rake)?p.rake:(l?l.rake:""),
       qty, chg:f?f.chg:null, cb, net,
+      und, undRs, comp,
+      rate:f?f.rate:null,
+      pol:f?f.pol:null, pola:f?f.pola:null,
+      enhc:f?f.enhc:null, fauc:f?f.fauc:null, dcla:f?f.dcla:null,
+      undPMT:(undRs!=null&&qty)? undRs/qty : null,
+      compPMT:(comp!=null&&qty)? comp/qty : null,
       sh, shPct: (sh!=null&&qty)? sh/qty*100 : null,
       shCB, shCBPct: (shCB!=null&&cb)? shCB/cb*100 : null,
       gcv:(l&&l.gcv!=null)?l.gcv:((p&&p.gcv!=null)?p.gcv:((f&&f.gcv!=null)?f.gcv:null)),
@@ -763,7 +808,9 @@ function build(){
 /* ===================== aggregation ===================== */
 function agg(list){
   const a={n:list.length,recv:0,qty:0,chg:0,net:0,cb:0,sh:0,shCB:0,gw:0,gq:0,frt:0,
-           qtyR:0,cbR:0,nG:0,hasQty:false,hasNet:false,hasSh:false,hasShCB:false};
+           qtyR:0,cbR:0,nG:0,hasQty:false,hasNet:false,hasSh:false,hasShCB:false,
+           und:0,undRs:0,qtyU:0,nU:0,hasUnd:false,
+           comp:0,qtyC:0,nC:0,hasComp:false};
   for(const r of list){
     if(r.status==="Received") a.recv++;
     if(r.qty!=null){a.qty+=r.qty;a.hasQty=true}
@@ -775,11 +822,20 @@ function agg(list){
     if(r.sh!=null){a.sh+=r.sh;a.hasSh=true;a.qtyR+=r.qty}
     if(r.shCB!=null){a.shCB+=r.shCB;a.hasShCB=true;a.cbR+=r.cb}
     if(r.frt!=null)a.frt+=r.frt;
+    /* Per-MT divides by the RR quantity of the rakes that actually carry the
+       figure, matching how the shortage percentages behave: a rake with no
+       freight row would otherwise inflate the denominator and flatter the rate. */
+    if(r.und!=null){a.und+=r.und;a.hasUnd=true;a.qtyU+=(r.qty||0);if(r.und>0)a.nU++;
+                    if(r.undRs!=null)a.undRs+=r.undRs;}
+    if(r.comp!=null){a.comp+=r.comp;a.hasComp=true;a.qtyC+=(r.qty||0);if(r.comp>0)a.nC++;}
     if(r.gcv!=null&&r.qty!=null&&r.qty>0){a.gw+=r.gcv*r.qty;a.gq+=r.qty;a.nG++}
   }
   a.gcv = a.gq>0 ? a.gw/a.gq : null;
   a.shPct = a.hasSh&&a.qtyR? a.sh/a.qtyR*100 : null;
   a.shCBPct = a.hasShCB&&a.cbR? a.shCB/a.cbR*100 : null;
+  a.undPMT  = a.hasUnd&&a.qtyU?  a.undRs/a.qtyU : null;   /* Rs per MT of RR qty */
+  a.compPMT = a.hasComp&&a.qtyC? a.comp/a.qtyC  : null;
+  a.undPct  = a.hasUnd&&a.qtyU?  a.und/(a.qtyU+a.und)*100 : null;
   return a;
 }
 
@@ -793,6 +849,12 @@ let SRC_FILTER=null, SORT={k:"date",dir:1};
    that view: it reports what actually reached the plant. */
 /* Returns the selector's own values, "rr" or "rcv", so comparisons elsewhere
    cannot drift from the markup. */
+/* Indian grouping: 1,52,44,426 rather than 15,244,426, since every other
+   figure the commercial team reconciles against is written that way. */
+function inr(v,d){
+  if(v==null||!isFinite(v)) return "\u2014";
+  return "\u20b9"+v.toLocaleString("en-IN",{minimumFractionDigits:d||0,maximumFractionDigits:d||0});
+}
 const basis = () => $("basis").value==="rcv" ? "rcv" : "rr";
 const basisDate = r => basis()==="rcv" ? r.rcv : r.date;
 const basisLabel = () => basis()==="rcv" ? "Rake receipt date" : "RR date";
@@ -830,7 +892,11 @@ const TOTS=[
   ["Shortage (RR \u2212 Plant)", a=>a.hasSh?fmt(a.sh,1):"\u2014",  a=>pct(a.shPct)+" of RR qty weighed in",     "MT"],
   ["Shortage (Coal bill \u2212 Plant)", a=>a.hasShCB?fmt(a.shCB,1):"\u2014", a=>pct(a.shCBPct)+" of coal bill wt", "MT"],
   ["Weighted avg GCV",a=>a.gcv!=null?fmt(a.gcv,0):"\u2014",
-     a=>a.gcv!=null?("PPGCL lab ARB \u00b7 "+a.nG+" of "+a.n+" rakes"):"no lab GCV available","kcal/kg"]
+     a=>a.gcv!=null?("PPGCL lab ARB \u00b7 "+a.nG+" of "+a.n+" rakes"):"no lab GCV available","kcal/kg"],
+  ["Underload", a=>a.hasUnd?fmt(a.und,1):"\u2014",
+     a=>a.hasUnd?(inr(a.undRs)+" at RATE(Q) \u00b7 "+inr(a.undPMT,2)+"/MT \u00b7 "+a.nU+" of "+a.n+" rakes"):"no chargeable weight","MT"],
+  ["POL+POLA+ENHC+FAUC+DCLA", a=>a.hasComp?inr(a.comp):"\u2014",
+     a=>a.hasComp?(inr(a.compPMT,2)+"/MT \u00b7 charged on "+a.nC+" of "+a.n+" rakes"):"columns not in freight file",""]
 ];
 
 function render(){
@@ -843,6 +909,8 @@ function render(){
     let cls="";
     if(i===3) cls = A.hasSh ? (A.sh>=0?"neg":"pos") : "";
     if(i===4) cls = A.hasShCB ? (A.shCB>=0?"neg":"pos") : "";
+    if(i===6) cls = A.hasUnd && A.und>0 ? "neg" : "";
+    if(i===7) cls = A.hasComp && A.comp>0 ? "neg" : "";
     return '<div class="tot"><span class="tot-k">'+t[0]+'</span>'+
       '<div class="tot-v '+cls+'">'+v+(u?'<span class="tot-u">'+u+'</span>':'')+'</div>'+
       '<div class="tot-s">'+s+'</div></div>';
@@ -873,6 +941,10 @@ function render(){
         row("Shortage RR\u2212Pl", a.hasSh?fmt(a.sh,1):"\u2014","MT", a.hasSh?(a.sh>=0?"neg":"pos"):"", a.hasSh?pct(a.shPct):"")+
         row("Shortage CB\u2212Pl", a.hasShCB?fmt(a.shCB,1):"\u2014","MT", a.hasShCB?(a.shCB>=0?"neg":"pos"):"", a.hasShCB?pct(a.shCBPct):"")+
         row("Wtd avg GCV", a.gcv!=null?fmt(a.gcv,0):"\u2014","kcal/kg")+
+        row("Underload", a.hasUnd?fmt(a.und,1):"\u2014","MT",
+            a.hasUnd&&a.und>0?"neg":"", a.hasUnd?inr(a.undPMT,2)+"/MT":"")+
+        row("POL+POLA+ENHC+FAUC+DCLA", a.hasComp?inr(a.comp):"\u2014","",
+            a.hasComp&&a.comp>0?"neg":"", a.hasComp?inr(a.compPMT,2)+"/MT":"")+
       '</div>'+
       '<div class="axis"><div class="axis-l"><span>excess</span><span>shortage % of RR qty</span><span>shortage</span></div>'+
       '<div class="bar">'+bar+'</div></div>'+
@@ -1011,7 +1083,10 @@ const COLS=[
   ["rr","RR no",1],["date","RR date",1],["src","Source",1],["rcv","Rake receipt",1],
   ["rake","Plant rake no",1],["qty","Qty as per RR",0],["cb","Coal bill wt",0],
   ["net","Plant net wt",0],["sh","Shortage RR\u2212Pl",0],["shPct","%",0],
-  ["shCB","Shortage CB\u2212Pl",0],["shCBPct","%",0],["gcv","GCV",0],["status","Status",1]
+  ["shCB","Shortage CB\u2212Pl",0],["shCBPct","%",0],["gcv","GCV",0],
+  ["und","Underload MT",0],["undRs","Underload \u20b9",0],["undPMT","\u20b9/MT",0],
+  ["comp","Charges \u20b9",0],["compPMT","\u20b9/MT",0],
+  ["status","Status",1]
 ];
 
 function renderTable(list){
@@ -1035,9 +1110,14 @@ function renderTable(list){
       '<td class="'+(r.shCB==null?"":r.shCB>=0?"neg":"pos")+'">'+fmt(r.shCB,2)+'</td>'+
       '<td class="'+(r.shCBPct==null?"":r.shCBPct>=0?"neg":"pos")+'">'+pct(r.shCBPct)+'</td>'+
       '<td>'+(r.gcv!=null?fmt(r.gcv,0):"\u2014")+'</td>'+
+      '<td class="'+(r.und?"neg":"")+'">'+(r.und!=null?fmt(r.und,1):"\u2014")+'</td>'+
+      '<td class="'+(r.undRs?"neg":"")+'">'+inr(r.undRs)+'</td>'+
+      '<td class="'+(r.undPMT?"neg":"")+'">'+inr(r.undPMT,2)+'</td>'+
+      '<td class="'+(r.comp?"neg":"")+'">'+inr(r.comp)+'</td>'+
+      '<td class="'+(r.compPMT?"neg":"")+'">'+inr(r.compPMT,2)+'</td>'+
       '<td class="l"><span class="pill '+(awa?"awa":"rcv")+'">'+r.status+'</span></td>'+
     '</tr>';
-  }).join("") || '<tr><td colspan="14" class="l" style="padding:34px;text-align:center;color:var(--muted)">No rakes match.</td></tr>';
+  }).join("") || '<tr><td colspan="19" class="l" style="padding:34px;text-align:center;color:var(--muted)">No rakes match.</td></tr>';
   $("tblNote").textContent = rows.length+" of "+list.length+" rakes in range"+(SRC_FILTER?" \u00b7 source "+SRC_FILTER+" (click the docket again to clear)":"");
 }
 
@@ -1050,6 +1130,9 @@ function footNote(A){
    '<b>Weighted average GCV</b> is weighted on quantity as per RR across only those rakes that carry a lab GCV. '+
    'The <b>Last N by source</b> panels count back from the most recent rake in the selected range, per source, over only those rakes that carry the figure in question \u2014 so the shortage panel skips rakes not yet weighed in, and the quality panel skips rakes without a lab GCV. '+
    'Rakes marked <i>Awaited</i> have no plant net weight yet, so they add to quantity as per RR but not to shortage. '+
+   '<b>Underload</b> = WGHT CHRG \u2212 WGHT ACTL, floored at zero, i.e. chargeable tonnage paid for but not railed; a rake loaded above its chargeable weight shows nil here and is penalised through POL instead. It is valued at that rake\u2019s own RATE(Q). '+
+   '<b>POL+POLA+ENHC+FAUC+DCLA</b> sums those heads only. POLA is included in the POL head because it is a distinct charge, never equal to POL and often present where POL is nil; POL1 by contrast merely restates POL and is excluded to avoid double-counting, as are SD, ST and GST \u2014 so this figure is deliberately not TOTAL OTHR CHRG. '+
+   '<b>Per MT</b> figures for both divide by quantity as per RR over only those rakes carrying the figure. '+
    'Weights are in MT. Files are read in this browser and never uploaded.';
 }
 
@@ -1450,6 +1533,9 @@ const C={ink:"FF131C26",ink2:"FF3D4C5C",muted:"FF6E7D8C",base:"FFE4E8EC",panel:"
   band:"FFF1F5F7",white:"FFFFFFFF"};
 const MONO="Consolas", SANS="Arial";
 const N2='#,##0.00', N1='#,##0.0', N0='#,##0', P3='0.000"%"';
+/* Indian lakh/crore grouping, matching the on-screen figures. */
+const R0='[>=10000000]\u20b9\\ #\\,##\\,##\\,##0;[>=100000]\u20b9\\ #\\,##\\,##0;\u20b9\\ #\\,##0',
+      R2='\u20b9\\ #\\,##0.00';
 
 /* ExcelJS turns a Date into a serial via getTime(), which is UTC-based. Handing it
    a local-midnight Date therefore writes the previous day for anyone east of UTC
@@ -1480,9 +1566,9 @@ $("exp").addEventListener("click",async()=>{
     const ws=wb.addWorksheet("Dashboard",{views:[{showGridLines:false}],
       pageSetup:{orientation:"landscape",fitToPage:true,fitToWidth:1,fitToHeight:0,
                  margins:{left:0.3,right:0.3,top:0.4,bottom:0.4,header:0.2,footer:0.2}}});
-    const W=[22,13,13,13,17,17,17,17,14,19,17,14,13,16];
+    const W=[22,13,13,13,17,17,17,17,14,19,17,14,13,16,15,17,15,17,15];
     W.forEach((w,i)=>ws.getColumn(i+1).width=w);
-    const LAST=14;
+    const LAST=19;   /* 8 cards x 2 cols = 16, by-source table needs 19 */
 
     ws.mergeCells(1,1,1,LAST);
     const t=ws.getCell(1,1);
@@ -1510,7 +1596,13 @@ $("exp").addEventListener("click",async()=>{
       ["SHORTAGE COAL BILL \u2212 PLANT  (MT)", A.hasShCB?A.shCB:null, pct(A.shCBPct)+" of coal bill wt",
         A.hasShCB?(A.shCB>=0?C.red:C.teal):null, N1],
       ["WEIGHTED AVG GCV  (KCAL/KG)", A.gcv, A.gcv!=null?("PPGCL ARB \u00b7 "+A.nG+" of "+A.n+" rakes"):"no lab GCV",
-        null, N0]
+        null, N0],
+      ["UNDERLOAD  (MT)", A.hasUnd?A.und:null,
+        A.hasUnd?(inr(A.undRs)+" \u00b7 "+inr(A.undPMT,2)+"/MT \u00b7 "+A.nU+" of "+A.n+" rakes"):"no chargeable wt",
+        A.hasUnd&&A.und>0?C.red:null, N1],
+      ["POL+POLA+ENHC+FAUC+DCLA", A.hasComp?A.comp:null,
+        A.hasComp?(inr(A.compPMT,2)+"/MT \u00b7 "+A.nC+" of "+A.n+" rakes charged"):"columns absent",
+        A.hasComp&&A.comp>0?C.red:null, R0]
     ];
     const R=4;
     ws.getRow(R).height=17; ws.getRow(R+1).height=26; ws.getRow(R+2).height=15;
@@ -1548,7 +1640,9 @@ $("exp").addEventListener("click",async()=>{
     const HDR=["Source","Rakes","Received","Awaited","Qty as per RR (MT)","Qty weighed in (MT)",
       "Plant net wt (MT)","Shortage RR\u2212Pl (MT)","Shortage RR\u2212Pl (%)",
       "Coal bill wt, weighed in (MT)","Shortage CB\u2212Pl (MT)","Shortage CB\u2212Pl (%)",
-      "Rakes with lab GCV","Wtd avg GCV, PPGCL ARB"];
+      "Rakes with lab GCV","Wtd avg GCV, PPGCL ARB",
+      "Underload (MT)","Underload (\u20b9)","Underload (\u20b9/MT)",
+      "POL+POLA+ENHC+FAUC+DCLA (\u20b9)","Charges (\u20b9/MT)"];
     const hr=ws.getRow(r); hr.height=32;
     HDR.forEach((h,i)=>{
       const c=hr.getCell(i+1);
@@ -1563,8 +1657,10 @@ $("exp").addEventListener("click",async()=>{
     for(const x of list){const k=x.src||"(blank)";if(!bySrc.has(k))bySrc.set(k,[]);bySrc.get(k).push(x)}
     const srcs=[...bySrc.entries()].map(([k,rs])=>[k,agg(rs)]).sort((a,b)=>b[1].qty-a[1].qty);
     const line=a=>[a.n,a.recv,a.n-a.recv,a.hasQty?a.qty:null,a.qtyR||null,a.hasNet?a.net:null,
-      a.hasSh?a.sh:null,a.shPct,a.cbR||null,a.hasShCB?a.shCB:null,a.shCBPct,a.nG,a.gcv];
-    const FMT=[N0,N0,N0,N1,N1,N1,N1,P3,N1,N1,P3,N0,N0];
+      a.hasSh?a.sh:null,a.shPct,a.cbR||null,a.hasShCB?a.shCB:null,a.shCBPct,a.nG,a.gcv,
+      a.hasUnd?a.und:null,a.hasUnd?a.undRs:null,a.undPMT,
+      a.hasComp?a.comp:null,a.compPMT];
+    const FMT=[N0,N0,N0,N1,N1,N1,N1,P3,N1,N1,P3,N0,N0,N1,R0,R2,R0,R2];
     const dataStart=r;
     const put=(label,a,total)=>{
       const row=ws.getRow(r); row.height=17;
@@ -1580,6 +1676,8 @@ $("exp").addEventListener("click",async()=>{
         let col=C.ink;
         if((i===6||i===7)&&a.hasSh) col=a.sh>=0?C.red:C.teal;
         if((i===9||i===10)&&a.hasShCB) col=a.shCB>=0?C.red:C.teal;
+        if((i===13||i===14||i===15)&&a.hasUnd&&a.und>0) col=C.red;
+        if((i===16||i===17)&&a.hasComp&&a.comp>0) col=C.red;
         c.font={name:MONO,size:10.5,bold:!!total,color:{argb:col}};
         c.alignment={vertical:"middle",horizontal:"right",indent:1};
         c.fill=fill(bg);
@@ -1664,6 +1762,9 @@ $("exp").addEventListener("click",async()=>{
       "GCV is the ARB figure from the PPGCL Lab Report block of the lab file, matched on RR number; the IGI and equilibrated blocks are ignored.",
       "Weighted average GCV is weighted on quantity as per RR, over only those rakes carrying a lab GCV.",
       "Last-N tables count back from the most recent rake per source within the date range, over only rakes carrying the figure shown; \u201crakes available\u201d is how many qualified in total.",
+      "Underload = WGHT CHRG \u2212 WGHT ACTL per rake, floored at zero, valued at that rake's RATE(Q). A rake railed above its chargeable weight shows nil and attracts POL instead.",
+      "POL+POLA+ENHC+FAUC+DCLA sums those heads only. POLA is included in the POL head as a distinct charge; POL1 restates POL and is excluded, as are SD, ST and GST, so this is not TOTAL OTHR CHRG.",
+      "Per-MT figures divide by quantity as per RR across only the rakes carrying that figure.",
       "Date basis for this report: "+basisLabel()+"."
     ];
     for(const n of notes){
@@ -1683,9 +1784,14 @@ $("exp").addEventListener("click",async()=>{
     const H2=["RR no","RR date","Source","Rake receipt date","Plant rake no","Qty as per RR (MT)",
       "Chargeable wt (MT)","Coal bill wt (MT)","Plant net wt (MT)","Shortage RR\u2212Pl (MT)",
       "Shortage RR\u2212Pl (%)","Shortage CB\u2212Pl (MT)","Shortage CB\u2212Pl (%)",
-      "GCV ARB, PPGCL lab (kcal/kg)","Grade","Mines","Wagons supplied","Sick wagons",
+      "GCV ARB, PPGCL lab (kcal/kg)",
+      "Underload (MT)","Underload (\u20b9)","Underload (\u20b9/MT)",
+      "POL+POLA+ENHC+FAUC+DCLA (\u20b9)","Charges (\u20b9/MT)",
+      "Grade","Mines","Wagons supplied","Sick wagons",
       "Freight incl. demurrage","Invoice no","FNR","Status"];
-    const W2=[13,15,9,17,13,15,15,15,15,16,14,16,14,17,9,14,12,11,17,11,14,11];
+    const W2=[13,15,9,17,13,15,15,15,15,16,14,16,14,17,
+              14,16,15,20,15,
+              9,14,12,11,17,11,14,11];
     W2.forEach((w,i)=>ws2.getColumn(i+1).width=w);
     const h2=ws2.getRow(1); h2.height=34;
     H2.forEach((h,i)=>{
@@ -1693,16 +1799,23 @@ $("exp").addEventListener("click",async()=>{
       c.value=h;
       c.font={name:SANS,size:8,bold:true,color:{argb:C.white}};
       c.fill=fill(C.ink);
-      c.alignment={vertical:"middle",horizontal:i<5||i>13?"left":"right",wrapText:true,indent:1};
+      /* left-align the identifier and text columns; the new 15-19 block is numeric */
+      c.alignment={vertical:"middle",horizontal:(i<5||i>18)?"left":"right",wrapText:true,indent:1};
     });
-    const LEFT=new Set([1,2,3,4,5,15,16,20,21,22]);
-    const F2={6:N1,7:N1,8:N2,9:N1,10:N1,11:P3,12:N2,13:P3,14:N0,17:N0,18:N0,19:N0};
+    /* Columns 15-19 are the new underload / charges block; everything that used
+       to sit at 15+ shifts right by five. */
+    const LEFT=new Set([1,2,3,4,5,20,21,25,26,27]);
+    const F2={6:N1,7:N1,8:N2,9:N1,10:N1,11:P3,12:N2,13:P3,14:N0,
+              15:N1,16:R0,17:R2,18:R0,19:R2,
+              22:N0,23:N0,24:N0};
     let rr2=2;
     for(const x of tableRows(list)){
       const row=ws2.getRow(rr2); row.height=15;
       const bg = rr2%2 ? C.band : C.panel;
       const vals=[x.rr,xlDate(x.date),x.src,xlDate(x.rcv),x.rake||null,x.qty,x.chg,x.cb,x.net,x.sh,x.shPct,
-        x.shCB,x.shCBPct,x.gcv,x.grade||null,x.mines||null,x.box,x.sick,x.frt,x.inv||null,x.fnr||null,x.status];
+        x.shCB,x.shCBPct,x.gcv,
+        x.und,x.undRs,x.undPMT,x.comp,x.compPMT,
+        x.grade||null,x.mines||null,x.box,x.sick,x.frt,x.inv||null,x.fnr||null,x.status];
       vals.forEach((v,i)=>{
         const n=i+1, c=row.getCell(n);
         c.value=v;
@@ -1711,8 +1824,10 @@ $("exp").addEventListener("click",async()=>{
         let col=C.ink;
         if((n===10||n===11)&&x.sh!=null) col=x.sh>=0?C.red:C.teal;
         if((n===12||n===13)&&x.shCB!=null) col=x.shCB>=0?C.red:C.teal;
-        if(n===22) col=x.status==="Received"?C.teal:C.amber;
-        c.font={name:MONO,size:9.5,color:{argb:col},bold:n===22};
+        if((n===15||n===16||n===17)&&x.und) col=C.red;
+        if((n===18||n===19)&&x.comp) col=C.red;
+        if(n===27) col=x.status==="Received"?C.teal:C.amber;
+        c.font={name:MONO,size:9.5,color:{argb:col},bold:n===27};
         c.alignment={vertical:"middle",horizontal:LEFT.has(n)?"left":"right",indent:1};
         c.fill=fill(bg);
         c.border={bottom:side("thin",C.rule2)};
