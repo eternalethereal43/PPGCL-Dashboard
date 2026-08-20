@@ -1294,79 +1294,99 @@ addEventListener("drop",async e=>{
 })();
 
 /* ===================== published data (auto-load) =====================
-   When this page is served over http(s) it looks for data/manifest.json and
-   loads the workbooks named there, so a visitor sees the dashboard without
-   picking any files. Each workbook is fetched, wrapped in a File and handed
-   to the same load() used by the upload boxes, so parsing, error reporting
-   and the per-zone status text are all unchanged.
+   Looks for workbooks published alongside this page so a visitor sees the
+   dashboard without picking files. It is deliberately forgiving about where
+   they are, because the common failure is a folder that did not get created:
 
-   If the manifest is missing, unreachable, or the page is opened from
-   file://, this quietly does nothing and the manual upload boxes work as
-   they always did. Auto-loading never blocks manual use: dropping a file on
-   a zone still overrides whatever was published. */
-const DATA_DIR = "data/";
-let AUTO_DONE = false;
+     1. data/manifest.json   \u2014 folder + manifest  (tidiest)
+     2. manifest.json        \u2014 manifest beside index.html, no folder
+     3. no manifest at all   \u2014 probe default filenames in data/ then beside
+                                index.html, so dropping three .xlsx next to
+                                this file is enough
 
-async function fetchBook(name, kind){
-  const res = await fetch(DATA_DIR + encodeURIComponent(name), {cache:"no-store"});
-  if(!res.ok) throw new Error(name + " \u2014 HTTP " + res.status);
-  const buf = await res.arrayBuffer();
-  if(buf.byteLength < 100) throw new Error(name + " \u2014 file looks empty");
-  /* a File built from the buffer keeps load()'s FileReader path intact */
-  await load(new File([buf], name), kind);
+   Each workbook is fetched, wrapped in a File and handed to the same load()
+   the upload boxes use, so parsing and per-zone status text are unchanged.
+   Manual upload always overrides whatever was published. */
+const DEFAULTS = {F:"Freight_data.xlsx", P:"Shortage.xlsx", L:"Quality.xlsx"};
+const TRIED = [];
+
+async function grab(url){
+  const r = await fetch(url, {cache:"no-store"});
+  TRIED.push(url + " \u2192 " + r.status);
+  if(!r.ok) throw new Error("HTTP " + r.status);
+  return r;
+}
+
+async function fetchBook(dir, name, kind){
+  const buf = await (await grab(dir + encodeURIComponent(name))).arrayBuffer();
+  if(buf.byteLength < 100) throw new Error("file looks empty");
+  await load(new File([buf], name), kind);      /* keeps load()'s FileReader path */
+}
+
+async function findManifest(){
+  for(const dir of ["data/", ""]){
+    try{ return {dir, man: await (await grab(dir + "manifest.json")).json()}; }
+    catch(e){ /* try the next location */ }
+  }
+  return null;
 }
 
 (async function autoLoad(){
-  console.log("[rake] auto-load starting \u00b7 build 2 \u00b7 " + location.href);
+  console.log("[rake] auto-load \u00b7 build 3 \u00b7 " + location.href);
   if(location.protocol === "file:"){
-    fmsg("Opened from a local file, so published data cannot be fetched \u2014 "
-       + "browsers block that on file:// URLs. Use the boxes above, or open the "
-       + "hosted address instead.");
-    return;
-  }
-  let man;
-  try{
-    const r = await fetch(DATA_DIR + "manifest.json", {cache:"no-store"});
-    if(!r.ok){
-      fmsg('<span class="bad">No published data found</span> \u2014 '
-         + DATA_DIR + "manifest.json returned HTTP " + r.status
-         + ". Set the files manually below, or check that the <b>data</b> folder "
-         + "sits next to index.html in the repository.");
-      console.warn("[rake] manifest HTTP " + r.status);
-      return;
-    }
-    man = await r.json();
-  }catch(e){
-    fmsg('<span class="bad">Published data could not be read</span> \u2014 '
-       + e.message + ". Set the files manually below.");
-    console.warn("[rake] manifest error", e);
+    fmsg("Opened from a local file, so published data cannot be fetched \u2014 browsers "
+       + "block that on file:// URLs. Use the boxes above, or open the hosted address.");
     return;
   }
 
-  const want = SLOTS.filter(s => man[s.kind]);
+  const found = await findManifest();
+  let dir, names, via;
+  if(found){
+    dir = found.dir; names = found.man; via = "manifest";
+  }else{
+    /* no manifest anywhere \u2014 probe the default names in both places */
+    names = DEFAULTS; via = "defaults";
+    dir = null;
+    for(const d of ["data/", ""]){
+      try{ await grab(d + encodeURIComponent(DEFAULTS.F)); dir = d; break; }
+      catch(e){ /* keep looking */ }
+    }
+    if(dir === null){
+      fmsg('<span class="bad">No published data found.</span> Set the files manually '
+         + "below. Tried: " + TRIED.join(" \u00b7 ")
+         + ". To publish, commit the three workbooks either in a <b>data</b> folder "
+         + "or straight next to index.html.");
+      console.warn("[rake] nothing found. tried:", TRIED);
+      return;
+    }
+  }
+
+  const want = SLOTS.filter(s => names[s.kind]);
   if(!want.length){
-    fmsg('<span class="bad">manifest.json has no F / P / L entries</span> \u2014 '
-       + "it needs the three workbook filenames. Set the files manually below.");
+    fmsg('<span class="bad">manifest.json has no F / P / L entries.</span> '
+       + "It needs the three workbook filenames. Set the files manually below.");
     return;
   }
 
   fmsg("Loading published data\u2026");
   const done = [], failed = [];
-  /* sequential, not parallel: the readers append to the shared WARN list and
-     each load() triggers a rebuild, so order needs to be deterministic */
+  /* sequential: the readers append to a shared WARN list and each load()
+     triggers a rebuild, so order needs to be deterministic */
   for(const s of want){
-    try{ await fetchBook(man[s.kind], s.kind); done.push(s.name); }
-    catch(err){ failed.push(s.name + " (" + err.message + ")"); }
+    try{ await fetchBook(dir, names[s.kind], s.kind); done.push(s.name); }
+    catch(err){ failed.push(s.name + " (" + names[s.kind] + " \u2014 " + err.message + ")"); }
   }
 
-  AUTO_DONE = done.length > 0;
-  const when = man.updated ? " \u00b7 data as at <b>" + man.updated + "</b>" : "";
-  const bad  = failed.length ? ' \u00b7 <span class="bad">' + failed.join(", ") + "</span>" : "";
+  const where = dir === "" ? "beside index.html" : "in " + dir;
+  const when  = names.updated ? " \u00b7 data as at <b>" + names.updated + "</b>" : "";
+  const bad   = failed.length ? ' \u00b7 <span class="bad">' + failed.join(", ") + "</span>" : "";
   fmsg(done.length
-    ? '<span class="ok">Published data loaded</span> \u2014 ' + done.join(", ") + when + bad
+    ? '<span class="ok">Published data loaded</span> \u2014 ' + done.join(", ")
+      + " (" + where + (via === "defaults" ? ", default names" : "") + ")" + when + bad
       + " \u00b7 drop your own file on a box above to override it."
-    : '<span class="bad">Published data could not be loaded.</span> ' + bad
-      + " Use the boxes above to set the files yourself.");
+    : '<span class="bad">Published data could not be loaded.</span>' + bad
+      + " Tried: " + TRIED.join(" \u00b7 "));
+  console.log("[rake] tried:", TRIED);
 })();
 
 function ready(){
