@@ -1317,16 +1317,38 @@ async function fetchBook(name, kind){
 }
 
 (async function autoLoad(){
-  if(location.protocol === "file:") return;      /* no fetch from file:// */
+  console.log("[rake] auto-load starting \u00b7 build 2 \u00b7 " + location.href);
+  if(location.protocol === "file:"){
+    fmsg("Opened from a local file, so published data cannot be fetched \u2014 "
+       + "browsers block that on file:// URLs. Use the boxes above, or open the "
+       + "hosted address instead.");
+    return;
+  }
   let man;
   try{
     const r = await fetch(DATA_DIR + "manifest.json", {cache:"no-store"});
-    if(!r.ok) return;                            /* nothing published \u2014 manual mode */
+    if(!r.ok){
+      fmsg('<span class="bad">No published data found</span> \u2014 '
+         + DATA_DIR + "manifest.json returned HTTP " + r.status
+         + ". Set the files manually below, or check that the <b>data</b> folder "
+         + "sits next to index.html in the repository.");
+      console.warn("[rake] manifest HTTP " + r.status);
+      return;
+    }
     man = await r.json();
-  }catch(e){ return; }
+  }catch(e){
+    fmsg('<span class="bad">Published data could not be read</span> \u2014 '
+       + e.message + ". Set the files manually below.");
+    console.warn("[rake] manifest error", e);
+    return;
+  }
 
   const want = SLOTS.filter(s => man[s.kind]);
-  if(!want.length) return;
+  if(!want.length){
+    fmsg('<span class="bad">manifest.json has no F / P / L entries</span> \u2014 '
+       + "it needs the three workbook filenames. Set the files manually below.");
+    return;
+  }
 
   fmsg("Loading published data\u2026");
   const done = [], failed = [];
